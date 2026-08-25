@@ -1,58 +1,78 @@
-# workflow 名称
 name: image-mirror
 
-# 当新建 issues 时，触发
 on:
   issues:
     types:
       - opened
       - reopened
       - edited
+  # 添加手动触发
+  workflow_dispatch:
+    inputs:
+      test_images:
+        description: '测试镜像列表（每行一个，如 nginx:latest）'
+        required: true
+        type: string
+      branch:
+        description: '运行分支'
+        required: false
+        default: 'test'
+        type: string
 
-
-# 需要执行的任务列表
 jobs:
-  # 镜像转换任务
   sync_to_target_registry:
-    # 运行环境
     runs-on: ubuntu-22.04
-    # 运行条件 => issues 的 label 包含 image-mirror
-    # if: contains(github.event.issue.labels.*.name, 'image-mirror')
     concurrency:
-      group: ${{ github.workflow }}-${{ github.actor }}-${{ github.event.issue.number }}
+      group: ${{ github.workflow }}-${{ github.actor }}-${{ github.event.issue.number || github.run_id }}
       cancel-in-progress: false
-    # 镜像转换任务的步骤列表
+    
     steps:
-
       - name: Check out code
-        uses: actions/checkout@v2
-      # - uses: hmarr/debug-action@v2
-      #   name: debug
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
+
       - name: Set up Python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v5
         with:
           python-version: '3.x'
+
+      # 根据触发方式准备镜像列表
+      - name: Prepare image source
+        id: image_source
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # 手动触发：使用输入的镜像列表
+            echo "source=manual" >> $GITHUB_OUTPUT
+            echo "${{ github.event.inputs.test_images }}" > issue_body.txt
+          else
+            # issue 触发：使用 issue body
+            echo "source=issue" >> $GITHUB_OUTPUT
+            echo "${{ github.event.issue.body }}" > issue_body.txt
+          fi
 
       - name: Check issue body for image format
         id: check_body
         run: |
-          python .github/scripts/check_image_format.py "${{ github.event.issue.body }}"
+          python .github/scripts/check_image_format.py "$(cat issue_body.txt)"
 
       - name: Add comment if body is not image format
-        if: steps.check_body.outputs.is_image_format == 'false'
-        uses: peter-evans/create-or-update-comment@v2
+        if: steps.check_body.outputs.is_image_format == 'false' && github.event_name == 'issues'
+        uses: peter-evans/create-or-update-comment@v4
         with:
           issue-number: ${{ github.event.issue.number }}
           body: |
             @${{ github.event.issue.user.login }} 
-            !!!请使用标准镜像格式
-            1. 镜像要带tag,如nginx,请写为nginx:latest
-            2. 标题不重要,issue描述部分,每行一个镜像不要有其他内容,你可以直接更新你的issue
-          reactions: hooray
+            ⚠️ 请使用标准镜像格式
+            1. 镜像要带 tag，如 nginx，请写为 nginx:latest
+            2. issue 描述部分，每行一个镜像，不要有其他内容
+            3. 你可以直接编辑更新你的 issue
+          reactions: eyes
           edit-mode: replace
+
       - name: Update issue title with image summary
-        if: steps.check_body.outputs.is_image_format == 'true'
-        uses: actions/github-script@v5
+        if: steps.check_body.outputs.is_image_format == 'true' && github.event_name == 'issues'
+        uses: actions/github-script@v7
         with:
           script: |
             const issue_number = context.issue.number;
@@ -60,14 +80,13 @@ jobs:
             const repo = context.repo.repo;
             const body = context.payload.issue.body;
 
-            // 🧾 拆分 body，并跳过第一行
             const lines = body.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
-            const images = lines.slice(1); // 从第二行开始提取镜像名
+            const images = lines.slice(1);
 
             const top3 = images.slice(0, 3).join(' | ');
             const total = images.length;
 
-            const newTitle = `${top3}  (共 ${total} 个镜像)`;
+            const newTitle = `${top3} (共 ${total} 个镜像)`;
 
             await github.rest.issues.update({
               owner,
@@ -77,58 +96,135 @@ jobs:
             });
 
       - name: Add image-mirror label if body is image format
-        if: steps.check_body.outputs.is_image_format == 'true'
+        if: steps.check_body.outputs.is_image_format == 'true' && github.event_name == 'issues'
         uses: actions-ecosystem/action-add-labels@v1
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           labels: 'image-mirror'
 
-      - name: Create comment
-        if: ${{ steps.check_body.outputs.is_image_format == 'true' && steps.fc.outputs.comment-id == '' }}
-        uses: peter-evans/create-or-update-comment@v2
+      - name: Find existing comment
+        if: steps.check_body.outputs.is_image_format == 'true' && github.event_name == 'issues'
+        uses: peter-evans/find-comment@v3
+        id: fc
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          comment-author: 'github-actions[bot]'
+          body-includes: 'Syncing image to TargetRegistry'
+
+      - name: Create initial comment
+        if: steps.check_body.outputs.is_image_format == 'true' && steps.fc.outputs.comment-id == '' && github.event_name == 'issues'
+        uses: peter-evans/create-or-update-comment@v4
         with:
           issue-number: ${{ github.event.issue.number }}
           body: |
-            Syncing image to TargetRegistry, please wait a moment  
-            [Check the progress](https://github.com/${{ github.repository_owner }}/image-mirror/actions/runs/${{ github.run_id }})    
+            🚀 开始同步镜像到目标仓库，请稍候...
+            [查看进度](https://github.com/${{ github.repository_owner }}/image-mirror/actions/runs/${{ github.run_id }})
           reactions: rocket
 
-      - name: prepare
+      - name: Install Skopeo
         if: steps.check_body.outputs.is_image_format == 'true'
         run: |
-          wget -q  https://github.com/AliyunContainerService/image-syncer/releases/download/v1.5.4/image-syncer-v1.5.4-linux-amd64.tar.gz
-          tar zxf image-syncer-v1.5.4-linux-amd64.tar.gz 
-          sudo  apt install dos2unix 
-      - name: start sync
+          sudo apt-get update
+          sudo apt-get install -y skopeo
+
+      - name: Prepare image list
         if: steps.check_body.outputs.is_image_format == 'true'
-        id: syncImage
+        id: prepare
+        env:
+          TARGET_NAMESPACE: ${{ vars.TARGET_NAMESPACE }}
+          TARGET_REGISTRY: ${{ vars.TARGET_REGISTRY }}
+        run: |
+          # 读取准备好的 body
+          cat issue_body.txt > images-raw.txt
+          
+          # 清理文件：移除空白行、空格、制表符
+          sed -e 's/^[ \t]*//g' \
+              -e 's/[ \t]*$//g' \
+              -e '/^[[:space:]]*$/d' \
+              images-raw.txt | tail -n +2 > images-clean.txt
+          
+          # 生成源镜像和目标镜像映射
+          > source-images.txt
+          > target-images.txt
+          > sync-mapping.txt
+          
+          while IFS= read -r source_image; do
+            tag_name=$(echo "$source_image" | awk -F "/" '{print $NF}')
+            target_image="${TARGET_REGISTRY}/${TARGET_NAMESPACE}/${tag_name}"
+            
+            echo "$source_image" >> source-images.txt
+            echo "$target_image" >> target-images.txt
+            echo "$source_image -> $target_image" >> sync-mapping.txt
+          done < images-clean.txt
+          
+          image_count=$(wc -l < source-images.txt)
+          echo "image_count=$image_count" >> $GITHUB_OUTPUT
+          
+          echo "=== 待同步镜像列表 ==="
+          cat sync-mapping.txt
+
+      - name: Sync images with Skopeo
+        if: steps.check_body.outputs.is_image_format == 'true'
+        id: sync
         env:
           TARGET_REGISTRY_PASSWORD: ${{ secrets.TARGET_REGISTRY_PASSWORD }}
           TARGET_REGISTRY_USER: ${{ vars.TARGET_REGISTRY_USER }}
-          # TARGET_REGISTRY: index.docker.io
-          # TARGET_REGISTRY: registry.cn-hangzhou.aliyuncs.com
           TARGET_NAMESPACE: ${{ vars.TARGET_NAMESPACE }}
           TARGET_REGISTRY: ${{ vars.TARGET_REGISTRY }}
-        #处理body中的空格和tab和换行，并在结尾添加: ， 写入images.yml 文件
-        run: | 
-          echo "${{ github.event.issue.body }}" > images-init.yml 
-          dos2unix              images-init.yml
-          sed -i 's/^[ \t]*//g' images-init.yml
-          sed -i 's/[ \t]*$//g' images-init.yml
-          sed -i '/^[  ]*$/d'   images-init.yml
-          # img=$(cat images-init.yml)
-          img=$(tail -n +2 images-init.yml)
-          for i in ${img[@]}
-          do
-            tagName=$(echo $i | awk -F "/" '{print $NF}');
-            echo $i: ${TARGET_REGISTRY}/${TARGET_NAMESPACE}/${tagName} >> images.yml;
-            echo ${TARGET_REGISTRY}/${TARGET_NAMESPACE}/${tagName} >> dockerhub-image.yml;
-          done
-          cat images.yml
-          ./image-syncer  --auth=./auth.yml --images=./images.yml 
-      - name: Add Success Issues
-        if: ${{ success() && steps.check_body.outputs.is_image_format == 'true' }} 
-        uses: actions/github-script@v5
+        run: |
+          if [ -n "$TARGET_REGISTRY_USER" ] && [ -n "$TARGET_REGISTRY_PASSWORD" ]; then
+            echo "🔐 登录目标仓库..."
+            skopeo login "$TARGET_REGISTRY" \
+              --username "$TARGET_REGISTRY_USER" \
+              --password "$TARGET_REGISTRY_PASSWORD"
+          fi
+          
+          > sync-success.txt
+          > sync-failed.txt
+          
+          total=$(wc -l < source-images.txt)
+          current=0
+          
+          while IFS= read -r source_image && IFS= read -r target_image <&3; do
+            current=$((current + 1))
+            echo ""
+            echo "[$current/$total] 同步: $source_image"
+            echo "         -> $target_image"
+            
+            if skopeo copy \
+              --multi-arch all \
+              --retry-times 3 \
+              "docker://$source_image" \
+              "docker://$target_image"; then
+              echo "✅ 成功"
+              echo "$target_image" >> sync-success.txt
+            else
+              echo "❌ 失败: $source_image"
+              echo "$source_image -> $target_image" >> sync-failed.txt
+            fi
+          done < source-images.txt 3< target-images.txt
+          
+          success_count=$(wc -l < sync-success.txt 2>/dev/null || echo 0)
+          failed_count=$(wc -l < sync-failed.txt 2>/dev/null || echo 0)
+          
+          echo "success_count=$success_count" >> $GITHUB_OUTPUT
+          echo "failed_count=$failed_count" >> $GITHUB_OUTPUT
+          
+          echo ""
+          echo "=== 同步结果 ==="
+          echo "✅ 成功: $success_count"
+          echo "❌ 失败: $failed_count"
+          
+          if [ "$failed_count" -gt 0 ]; then
+            echo ""
+            echo "=== 失败列表 ==="
+            cat sync-failed.txt
+            exit 1
+          fi
+
+      - name: Add success label
+        if: success() && steps.check_body.outputs.is_image_format == 'true' && github.event_name == 'issues'
+        uses: actions/github-script@v7
         with:
           script: |
             github.rest.issues.addLabels({
@@ -138,70 +234,95 @@ jobs:
               labels: ['succeed']
             })
 
-      - id: get-comment-body
-        if: steps.check_body.outputs.is_image_format == 'true' 
+      - name: Prepare comment body
+        if: steps.check_body.outputs.is_image_format == 'true'
+        id: comment_body
         run: |
-          body="$(cat script.md)"
-          body="${body//'%'/'%25'}"
-          body="${body//$'\n'/'%0A'}"
-          body="${body//$'\r'/'%0D'}" 
-          echo "::set-output name=body::$body"
+          {
+            echo 'source_images<<EOF'
+            cat source-images.txt 2>/dev/null || echo ""
+            echo EOF
+          } >> $GITHUB_OUTPUT
+          
+          {
+            echo 'target_images<<EOF'
+            cat target-images.txt 2>/dev/null || echo ""
+            echo EOF
+          } >> $GITHUB_OUTPUT
+          
+          if [ -f script.md ]; then
+            {
+              echo 'extra_info<<EOF'
+              cat script.md
+              echo EOF
+            } >> $GITHUB_OUTPUT
+          fi
 
-          dockerhubImage="$(cat dockerhub-image.yml)"
-          dockerhubImage="${dockerhubImage//'%'/'%25'}"
-          dockerhubImage="${dockerhubImage//$'\n'/'%0A'}"
-          dockerhubImage="${dockerhubImage//$'\r'/'%0D'}" 
-          echo "::set-output name=dockerhubImage::$dockerhubImage"
-
-          sourceImage="$(cat images-init.yml)"
-          sourceImage="${sourceImage//'%'/'%25'}"
-          sourceImage="${sourceImage//$'\n'/'%0A'}"
-          sourceImage="${sourceImage//$'\r'/'%0D'}" 
-          echo "::set-output name=sourceImage::$sourceImage"
-
-      - name: Find Comment
-        if: steps.check_body.outputs.is_image_format == 'true'      
-        uses: peter-evans/find-comment@v2
-        id: fc
-        with:
-          issue-number: ${{ github.event.issue.number }}
-          comment-author: 'github-actions[bot]'
-          body-includes: Syncing image to TargetRegistry
-
-      - name: Add Tips
-        if: ${{ success() && steps.check_body.outputs.is_image_format == 'true'  }} 
-        uses: peter-evans/create-or-update-comment@v2
+      - name: Update comment on success
+        if: success() && steps.check_body.outputs.is_image_format == 'true' && github.event_name == 'issues'
+        uses: peter-evans/create-or-update-comment@v4
         with:
           comment-id: ${{ steps.fc.outputs.comment-id }}
           issue-number: ${{ github.event.issue.number }}
           body: |
-            [Check the progress](https://github.com/${{ github.repository_owner }}/image-mirror/actions/runs/${{ github.run_id }})              
-            ## 镜像信息如下
-            - dockerhub-image.yml  
-            ```shell
-            ${{ steps.get-comment-body.outputs.dockerhubImage }}
+            ✅ 镜像同步成功！
+            
+            [查看详情](https://github.com/${{ github.repository_owner }}/image-mirror/actions/runs/${{ github.run_id }})
+            
+            ## 📋 同步统计
+            - 总数: ${{ steps.prepare.outputs.image_count }}
+            - 成功: ${{ steps.sync.outputs.success_count }}
+            - 失败: ${{ steps.sync.outputs.failed_count }}
+            
+            ## 🎯 目标镜像列表
             ```
-            - images-init.yml
-            ```shell
-            ${{ steps.get-comment-body.outputs.sourceImage }}
-            ```            
-            ${{ steps.get-comment-body.outputs.body }}
+            ${{ steps.comment_body.outputs.target_images }}
+            ```
+            
+            ## 📦 源镜像列表
+            ```
+            ${{ steps.comment_body.outputs.source_images }}
+            ```
+            
+            ${{ steps.comment_body.outputs.extra_info }}
           reactions: hooray
           edit-mode: replace
-      - name: Add failure hint comment
-        if: failure() && steps.check_body.outputs.is_image_format == 'true'
-        uses: peter-evans/create-or-update-comment@v2
+
+      - name: Update comment on failure
+        if: failure() && steps.check_body.outputs.is_image_format == 'true' && github.event_name == 'issues'
+        uses: peter-evans/create-or-update-comment@v4
         with:
+          comment-id: ${{ steps.fc.outputs.comment-id }}
           issue-number: ${{ github.event.issue.number }}
           body: |
-            ❌ 镜像同步失败，请检查以下几点：
-            - 源镜像是否拼写错误？
+            ❌ 镜像同步失败
+            
+            请检查以下几点：
+            - 源镜像名称是否拼写正确？
             - tag 是否存在（如 `latest`、`1.21`）？
-            - 该镜像是否为公开可拉取的镜像？
-            - 若为私有镜像，请确认目标 registry 有访问权限
-
-            可参考 logs：
-            [查看工作详情](https://github.com/${{ github.repository_owner }}/image-mirror/actions/runs/${{ github.run_id }})
-
+            - 是否为公开可拉取的镜像？
+            - 如果是私有镜像，目标仓库是否有访问权限？
+            
+            ## 📊 同步统计
+            - 总数: ${{ steps.prepare.outputs.image_count }}
+            - 成功: ${{ steps.sync.outputs.success_count || 0 }}
+            - 失败: ${{ steps.sync.outputs.failed_count || 0 }}
+            
+            [查看详细日志](https://github.com/${{ github.repository_owner }}/image-mirror/actions/runs/${{ github.run_id }})
           reactions: confused
 
+      # 手动触发时的结果摘要
+      - name: Manual trigger summary
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          echo "## 🎯 测试运行完成" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**分支**: ${{ github.event.inputs.branch || github.ref }}" >> $GITHUB_STEP_SUMMARY
+          echo "**总数**: ${{ steps.prepare.outputs.image_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "**成功**: ${{ steps.sync.outputs.success_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "**失败**: ${{ steps.sync.outputs.failed_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 目标镜像" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat target-images.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
