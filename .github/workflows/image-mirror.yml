@@ -26,7 +26,7 @@ jobs:
       - name: Prepare image source
         id: image_source
         run: |
-          echo "source=issue" >> $GITHUB_OUTPUT
+          echo "source=issue" >> "$GITHUB_OUTPUT"
           echo "${{ github.event.issue.body }}" > issue_body.txt
 
       - name: Check issue body for image format
@@ -76,10 +76,15 @@ jobs:
 
       - name: Add image-mirror label
         if: steps.check_body.outputs.is_image_format == 'true'
-        uses: actions-ecosystem/action-add-labels@v1
+        uses: actions/github-script@v7
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          labels: 'image-mirror'
+          script: |
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: ['image-mirror']
+            });
 
       - name: Find existing comment
         if: steps.check_body.outputs.is_image_format == 'true'
@@ -134,24 +139,61 @@ jobs:
             echo "📦 检查镜像: $source_image"
             
             # 使用 skopeo inspect 获取镜像信息
-            if ! manifest=$(skopeo inspect --raw "docker://$source_image" 2>/dev/null); then
+            if ! raw_manifest=$(skopeo inspect --raw "docker://$source_image" 2>/dev/null); then
               echo "  ⚠️  无法获取镜像信息，跳过"
               continue
             fi
             
-            # 判断是否为 manifest list (多架构)
-            media_type=$(echo "$manifest" | jq -r '.mediaType // .schemaVersion' 2>/dev/null)
+            # 保存 manifest 到临时文件便于调试
+            echo "$raw_manifest" > /tmp/manifest.json
             
-            if echo "$manifest" | jq -e '.manifests' >/dev/null 2>&1; then
+            # 判断是否为 manifest list (多架构)
+            schema_version=$(echo "$raw_manifest" | jq -r '.schemaVersion // 0')
+            media_type=$(echo "$raw_manifest" | jq -r '.mediaType // ""')
+            
+            # 检查是否为 manifest list
+            is_manifest_list=false
+            if [[ "$media_type" == "application/vnd.docker.distribution.manifest.list.v2+json" ]] || \
+               [[ "$media_type" == "application/vnd.oci.image.index.v1+json" ]] || \
+               echo "$raw_manifest" | jq -e '.manifests' >/dev/null 2>&1; then
+              is_manifest_list=true
+            fi
+            
+            if [ "$is_manifest_list" = true ]; then
               # 多架构镜像
               echo "  ℹ️  多架构镜像，支持以下架构:"
               
-              # 提取所有架构
-              architectures=$(echo "$manifest" | jq -r '.manifests[] | "\(.platform.architecture):\(.platform.variant // "")"')
+              # 提取所有架构信息
+              manifests_count=$(echo "$raw_manifest" | jq '.manifests | length')
               
-              while IFS= read -r arch_info; do
-                arch=$(echo "$arch_info" | cut -d: -f1)
-                variant=$(echo "$arch_info" | cut -d: -f2)
+              for ((i=0; i<manifests_count; i++)); do
+                arch=$(echo "$raw_manifest" | jq -r ".manifests[$i].platform.architecture // \"\"")
+                variant=$(echo "$raw_manifest" | jq -r ".manifests[$i].platform.variant // \"\"")
+                os=$(echo "$raw_manifest" | jq -r ".manifests[$i].platform.os // \"linux\"")
+                
+                # 检查是否为 attestation manifest
+                ref_type=$(echo "$raw_manifest" | jq -r ".manifests[$i].annotations.\"vnd.docker.reference.type\" // \"\"")
+                if [ "$ref_type" = "attestation-manifest" ]; then
+                  echo "    ⚠️  跳过 attestation manifest: index=$i"
+                  continue
+                fi
+                
+                # 跳过 unknown 架构
+                if [ "$arch" = "unknown" ] || [ -z "$arch" ] || [ "$arch" = "null" ]; then
+                  echo "    ⚠️  跳过无效架构: index=$i (arch=$arch, os=$os)"
+                  continue
+                fi
+                
+                # 跳过非 Linux 或 unknown 系统
+                if [ "$os" != "linux" ] || [ "$os" = "unknown" ]; then
+                  echo "    ⚠️  跳过非 Linux 系统: $os/$arch"
+                  continue
+                fi
+                
+                # 清理 variant
+                if [ "$variant" = "null" ] || [ -z "$variant" ]; then
+                  variant=""
+                fi
                 
                 # 生成架构后缀
                 if [ -n "$variant" ]; then
@@ -162,24 +204,45 @@ jobs:
                 
                 # 标准化架构名称
                 case "$arch_suffix" in
-                  amd64*) arch_suffix="amd64" ;;
-                  arm64*|aarch64*) arch_suffix="arm64" ;;
-                  arm_v7) arch_suffix="arm_v7" ;;
-                  arm_v6) arch_suffix="arm_v6" ;;
-                  arm_*) arch_suffix="arm_${variant}" ;;
-                  ppc64le*) arch_suffix="ppc64le" ;;
-                  s390x*) arch_suffix="s390x" ;;
-                  386*) arch_suffix="386" ;;
-                  riscv64*) arch_suffix="riscv64" ;;
+                  amd64*|x86_64*) 
+                    arch_suffix="amd64" 
+                    ;;
+                  arm64*|aarch64*)
+                    arch_suffix="arm64"
+                    ;;
+                  arm_v8)
+                    # arm64 v8 实际上就是标准 arm64
+                    arch_suffix="arm64"
+                    ;;
+                  arm_v7|armv7*)
+                    arch_suffix="arm_v7"
+                    ;;
+                  arm_v6|armv6*)
+                    arch_suffix="arm_v6"
+                    ;;
+                  arm_v5|armv5*)
+                    arch_suffix="arm_v5"
+                    ;;
+                  ppc64le*)
+                    arch_suffix="ppc64le"
+                    ;;
+                  s390x*)
+                    arch_suffix="s390x"
+                    ;;
+                  386*|i386*)
+                    arch_suffix="386"
+                    ;;
+                  riscv64*)
+                    arch_suffix="riscv64"
+                    ;;
                 esac
                 
                 echo "    - $arch${variant:+/$variant} → ${arch_suffix}"
                 
                 # 生成目标镜像名
                 tag_name=$(echo "$source_image" | awk -F "/" '{print $NF}')
-                # 在 tag 后添加架构后缀
                 base_tag=$(echo "$tag_name" | cut -d: -f1)
-                version_tag=$(echo "$tag_name" | cut -d: -f2)
+                version_tag=$(echo "$tag_name" | cut -d: -f2-)
                 target_tag="${base_tag}:${version_tag}_${arch_suffix}"
                 target_image="${TARGET_REGISTRY}/${TARGET_NAMESPACE}/${target_tag}"
                 
@@ -188,18 +251,37 @@ jobs:
                 echo "docker pull $target_image" >> pull-commands.txt
                 
                 total_tasks=$((total_tasks + 1))
-              done <<< "$architectures"
+              done
               
             else
               # 单架构镜像
               echo "  ℹ️  单架构镜像"
               
-              # 获取架构信息
-              arch=$(echo "$manifest" | jq -r '.architecture // "amd64"')
-              variant=$(echo "$manifest" | jq -r '.variant // ""')
+              # 尝试多种方式获取架构信息
+              arch=$(echo "$raw_manifest" | jq -r '.architecture // empty')
+              
+              # 如果 raw manifest 没有 architecture，尝试用 skopeo inspect (非 raw)
+              if [ -z "$arch" ] || [ "$arch" = "null" ]; then
+                echo "    尝试获取详细信息..."
+                if detail_info=$(skopeo inspect "docker://$source_image" 2>/dev/null); then
+                  arch=$(echo "$detail_info" | jq -r '.Architecture // "amd64"')
+                  variant=$(echo "$detail_info" | jq -r '.Variant // ""')
+                else
+                  echo "    ⚠️  无法获取架构信息，默认使用 amd64"
+                  arch="amd64"
+                  variant=""
+                fi
+              else
+                variant=$(echo "$raw_manifest" | jq -r '.variant // ""')
+              fi
+              
+              # 清理 variant
+              if [ "$variant" = "null" ] || [ -z "$variant" ]; then
+                variant=""
+              fi
               
               # 生成架构后缀
-              if [ -n "$variant" ] && [ "$variant" != "null" ]; then
+              if [ -n "$variant" ]; then
                 arch_suffix="${arch}_${variant}"
               else
                 arch_suffix="${arch}"
@@ -207,14 +289,36 @@ jobs:
               
               # 标准化架构名称
               case "$arch_suffix" in
-                amd64*) arch_suffix="amd64" ;;
-                arm64*|aarch64*) arch_suffix="arm64" ;;
-                arm_v7) arch_suffix="arm_v7" ;;
-                arm_v6) arch_suffix="arm_v6" ;;
-                ppc64le*) arch_suffix="ppc64le" ;;
-                s390x*) arch_suffix="s390x" ;;
-                386*) arch_suffix="386" ;;
-                riscv64*) arch_suffix="riscv64" ;;
+                amd64*|x86_64*) 
+                  arch_suffix="amd64" 
+                  ;;
+                arm64*|aarch64*)
+                  arch_suffix="arm64"
+                  ;;
+                arm_v8)
+                  arch_suffix="arm64"
+                  ;;
+                arm_v7|armv7*)
+                  arch_suffix="arm_v7"
+                  ;;
+                arm_v6|armv6*)
+                  arch_suffix="arm_v6"
+                  ;;
+                arm_v5|armv5*)
+                  arch_suffix="arm_v5"
+                  ;;
+                ppc64le*)
+                  arch_suffix="ppc64le"
+                  ;;
+                s390x*)
+                  arch_suffix="s390x"
+                  ;;
+                386*|i386*)
+                  arch_suffix="386"
+                  ;;
+                riscv64*)
+                  arch_suffix="riscv64"
+                  ;;
               esac
               
               echo "    - $arch${variant:+/$variant} → ${arch_suffix}"
@@ -222,7 +326,7 @@ jobs:
               # 生成目标镜像名
               tag_name=$(echo "$source_image" | awk -F "/" '{print $NF}')
               base_tag=$(echo "$tag_name" | cut -d: -f1)
-              version_tag=$(echo "$tag_name" | cut -d: -f2)
+              version_tag=$(echo "$tag_name" | cut -d: -f2-)
               target_tag="${base_tag}:${version_tag}_${arch_suffix}"
               target_image="${TARGET_REGISTRY}/${TARGET_NAMESPACE}/${target_tag}"
               
@@ -234,17 +338,23 @@ jobs:
             
           done < images-clean.txt
           
+          # 去重（某些镜像可能有重复的架构条目）
+          sort -u sync-plan.txt -o sync-plan.txt
+          sort -u pull-commands.txt -o pull-commands.txt
+          
           source_image_count=$(wc -l < images-clean.txt)
+          total_tasks=$(wc -l < sync-plan.txt)
           
           echo ""
           echo "=== 同步计划 ==="
           echo "源镜像数: $source_image_count"
           echo "同步任务数: $total_tasks"
+          cat sync-plan.txt
           
-          echo "image_count=$source_image_count" >> $GITHUB_OUTPUT
-          echo "task_count=$total_tasks" >> $GITHUB_OUTPUT
-          echo "registry=${TARGET_REGISTRY}" >> $GITHUB_OUTPUT
-          echo "namespace=${TARGET_NAMESPACE}" >> $GITHUB_OUTPUT
+          echo "image_count=$source_image_count" >> "$GITHUB_OUTPUT"
+          echo "task_count=$total_tasks" >> "$GITHUB_OUTPUT"
+          echo "registry=${TARGET_REGISTRY}" >> "$GITHUB_OUTPUT"
+          echo "namespace=${TARGET_NAMESPACE}" >> "$GITHUB_OUTPUT"
           
           if [ "$total_tasks" -eq 0 ]; then
             echo "⚠️  没有可同步的镜像"
@@ -344,8 +454,8 @@ jobs:
           success_count=$(wc -l < sync-success.txt 2>/dev/null || echo 0)
           failed_count=$(wc -l < sync-failed.txt 2>/dev/null || echo 0)
           
-          echo "success_count=$success_count" >> $GITHUB_OUTPUT
-          echo "failed_count=$failed_count" >> $GITHUB_OUTPUT
+          echo "success_count=$success_count" >> "$GITHUB_OUTPUT"
+          echo "failed_count=$failed_count" >> "$GITHUB_OUTPUT"
           
           echo ""
           echo "=== 同步结果 ==="
@@ -375,29 +485,35 @@ jobs:
           
           # 成功的镜像列表
           if [ -f sync-success.txt ] && [ -s sync-success.txt ]; then
-            echo "success_images<<EOF_SUCCESS_${TIMESTAMP}" >> $GITHUB_OUTPUT
-            cat sync-success.txt >> $GITHUB_OUTPUT
-            echo "EOF_SUCCESS_${TIMESTAMP}" >> $GITHUB_OUTPUT
+            {
+              echo "success_images<<EOF_SUCCESS_${TIMESTAMP}"
+              cat sync-success.txt
+              echo "EOF_SUCCESS_${TIMESTAMP}"
+            } >> "$GITHUB_OUTPUT"
           else
-            echo "success_images=" >> $GITHUB_OUTPUT
+            echo "success_images=" >> "$GITHUB_OUTPUT"
           fi
           
           # 失败的镜像列表
           if [ -f sync-failed.txt ] && [ -s sync-failed.txt ]; then
-            echo "failed_images<<EOF_FAILED_${TIMESTAMP}" >> $GITHUB_OUTPUT
-            cat sync-failed.txt >> $GITHUB_OUTPUT
-            echo "EOF_FAILED_${TIMESTAMP}" >> $GITHUB_OUTPUT
+            {
+              echo "failed_images<<EOF_FAILED_${TIMESTAMP}"
+              cat sync-failed.txt
+              echo "EOF_FAILED_${TIMESTAMP}"
+            } >> "$GITHUB_OUTPUT"
           else
-            echo "failed_images=" >> $GITHUB_OUTPUT
+            echo "failed_images=" >> "$GITHUB_OUTPUT"
           fi
           
           # 详细同步结果
           if [ -f sync-details.txt ] && [ -s sync-details.txt ]; then
-            echo "sync_details<<EOF_DETAILS_${TIMESTAMP}" >> $GITHUB_OUTPUT
-            cat sync-details.txt >> $GITHUB_OUTPUT
-            echo "EOF_DETAILS_${TIMESTAMP}" >> $GITHUB_OUTPUT
+            {
+              echo "sync_details<<EOF_DETAILS_${TIMESTAMP}"
+              cat sync-details.txt
+              echo "EOF_DETAILS_${TIMESTAMP}"
+            } >> "$GITHUB_OUTPUT"
           else
-            echo "sync_details=" >> $GITHUB_OUTPUT
+            echo "sync_details=" >> "$GITHUB_OUTPUT"
           fi
           
           # Pull 命令 (只包含成功的)
@@ -407,11 +523,13 @@ jobs:
               echo "docker pull $target_image" >> pull-commands-success.txt
             done < sync-success.txt
             
-            echo "pull_commands<<EOF_PULL_${TIMESTAMP}" >> $GITHUB_OUTPUT
-            cat pull-commands-success.txt >> $GITHUB_OUTPUT
-            echo "EOF_PULL_${TIMESTAMP}" >> $GITHUB_OUTPUT
+            {
+              echo "pull_commands<<EOF_PULL_${TIMESTAMP}"
+              cat pull-commands-success.txt
+              echo "EOF_PULL_${TIMESTAMP}"
+            } >> "$GITHUB_OUTPUT"
           else
-            echo "pull_commands=" >> $GITHUB_OUTPUT
+            echo "pull_commands=" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Determine final status
@@ -423,18 +541,18 @@ jobs:
           
           if [ "$success_count" -gt 0 ]; then
             if [ "$failed_count" -eq 0 ]; then
-              echo "status=full_success" >> $GITHUB_OUTPUT
-              echo "label=succeed" >> $GITHUB_OUTPUT
-              echo "emoji=✅" >> $GITHUB_OUTPUT
+              echo "status=full_success" >> "$GITHUB_OUTPUT"
+              echo "label=succeed" >> "$GITHUB_OUTPUT"
+              echo "emoji=✅" >> "$GITHUB_OUTPUT"
             else
-              echo "status=partial_success" >> $GITHUB_OUTPUT
-              echo "label=partial-succeed" >> $GITHUB_OUTPUT
-              echo "emoji=⚠️" >> $GITHUB_OUTPUT
+              echo "status=partial_success" >> "$GITHUB_OUTPUT"
+              echo "label=partial-succeed" >> "$GITHUB_OUTPUT"
+              echo "emoji=⚠️" >> "$GITHUB_OUTPUT"
             fi
           else
-            echo "status=failed" >> $GITHUB_OUTPUT
-            echo "label=failed" >> $GITHUB_OUTPUT
-            echo "emoji=❌" >> $GITHUB_OUTPUT
+            echo "status=failed" >> "$GITHUB_OUTPUT"
+            echo "label=failed" >> "$GITHUB_OUTPUT"
+            echo "emoji=❌" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Add status label
