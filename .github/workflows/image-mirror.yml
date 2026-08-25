@@ -188,7 +188,7 @@ jobs:
             echo "         -> $target_image"
             
             if skopeo copy \
-              --multi-arch all \
+              --all \
               --retry-times 3 \
               "docker://$source_image" \
               "docker://$target_image"; then
@@ -231,27 +231,28 @@ jobs:
             })
 
       - name: Prepare comment body
-        if: steps.check_body.outputs.is_image_format == 'true'
         id: comment_body
         run: |
           {
             echo 'source_images<<EOF'
             cat source-images.txt 2>/dev/null || echo ""
-            echo EOF
+            echo 'EOF'
           } >> $GITHUB_OUTPUT
           
           {
             echo 'target_images<<EOF'
             cat target-images.txt 2>/dev/null || echo ""
-            echo EOF
+            echo 'EOF'
           } >> $GITHUB_OUTPUT
           
           if [ -f script.md ]; then
             {
               echo 'extra_info<<EOF'
               cat script.md
-              echo EOF
+              echo 'EOF'
             } >> $GITHUB_OUTPUT
+          else
+            echo 'extra_info=' >> $GITHUB_OUTPUT
           fi
 
       - name: Update comment on success
