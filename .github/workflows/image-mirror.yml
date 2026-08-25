@@ -160,13 +160,12 @@ jobs:
           cat sync-mapping.txt
 
       - name: Sync images with Skopeo
-        if: steps.check_body.outputs.is_image_format == 'true'
         id: sync
         env:
           TARGET_REGISTRY_PASSWORD: ${{ secrets.TARGET_REGISTRY_PASSWORD }}
           TARGET_REGISTRY_USER: ${{ vars.TARGET_REGISTRY_USER }}
-          TARGET_NAMESPACE: ${{ vars.TARGET_NAMESPACE }}
-          TARGET_REGISTRY: ${{ vars.TARGET_REGISTRY }}
+          TARGET_NAMESPACE: ${{ github.event.inputs.target_namespace || vars.TARGET_NAMESPACE }}
+          TARGET_REGISTRY: ${{ github.event.inputs.target_registry || vars.TARGET_REGISTRY }}
         run: |
           if [ -n "$TARGET_REGISTRY_USER" ] && [ -n "$TARGET_REGISTRY_PASSWORD" ]; then
             echo "🔐 登录目标仓库..."
@@ -188,7 +187,8 @@ jobs:
             echo "         -> $target_image"
             
             if skopeo copy \
-              --all \
+              --all         \
+              --format v2s2 \
               --retry-times 3 \
               "docker://$source_image" \
               "docker://$target_image"; then
@@ -217,6 +217,7 @@ jobs:
             cat sync-failed.txt
             exit 1
           fi
+
 
       - name: Add success label
         if: success() && steps.check_body.outputs.is_image_format == 'true' && github.event_name == 'issues'
