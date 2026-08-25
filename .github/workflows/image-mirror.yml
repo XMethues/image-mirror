@@ -45,6 +45,7 @@ jobs:
             1. 镜像要带 tag，如 nginx，请写为 nginx:latest
             2. issue 描述部分，每行一个镜像，不要有其他内容
             3. 你可以直接编辑更新你的 issue
+            4. 同步后会自动为每个架构生成带后缀的镜像，如 nginx:1.27_amd64, nginx:1.27_arm64
           reactions: eyes
           edit-mode: replace
 
@@ -100,13 +101,13 @@ jobs:
             [查看进度](https://github.com/${{ github.repository_owner }}/image-mirror/actions/runs/${{ github.run_id }})
           reactions: rocket
 
-      - name: Install Skopeo
+      - name: Install Skopeo and jq
         if: steps.check_body.outputs.is_image_format == 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y skopeo
+          sudo apt-get install -y skopeo jq
 
-      - name: Prepare image list
+      - name: Prepare and inspect images
         if: steps.check_body.outputs.is_image_format == 'true'
         id: prepare
         env:
@@ -121,28 +122,134 @@ jobs:
               -e '/^[[:space:]]*$/d' \
               images-raw.txt | tail -n +2 > images-clean.txt
           
-          > source-images.txt
-          > target-images.txt
-          > sync-mapping.txt
+          > sync-plan.txt
           > pull-commands.txt
           
+          echo "=== 检查镜像支持的架构 ==="
+          
+          total_tasks=0
+          
           while IFS= read -r source_image; do
-            tag_name=$(echo "$source_image" | awk -F "/" '{print $NF}')
-            target_image="${TARGET_REGISTRY}/${TARGET_NAMESPACE}/${tag_name}"
+            echo ""
+            echo "📦 检查镜像: $source_image"
             
-            echo "$source_image" >> source-images.txt
-            echo "$target_image" >> target-images.txt
-            echo "$source_image -> $target_image" >> sync-mapping.txt
-            echo "docker pull $target_image" >> pull-commands.txt
+            # 使用 skopeo inspect 获取镜像信息
+            if ! manifest=$(skopeo inspect --raw "docker://$source_image" 2>/dev/null); then
+              echo "  ⚠️  无法获取镜像信息，跳过"
+              continue
+            fi
+            
+            # 判断是否为 manifest list (多架构)
+            media_type=$(echo "$manifest" | jq -r '.mediaType // .schemaVersion' 2>/dev/null)
+            
+            if echo "$manifest" | jq -e '.manifests' >/dev/null 2>&1; then
+              # 多架构镜像
+              echo "  ℹ️  多架构镜像，支持以下架构:"
+              
+              # 提取所有架构
+              architectures=$(echo "$manifest" | jq -r '.manifests[] | "\(.platform.architecture):\(.platform.variant // "")"')
+              
+              while IFS= read -r arch_info; do
+                arch=$(echo "$arch_info" | cut -d: -f1)
+                variant=$(echo "$arch_info" | cut -d: -f2)
+                
+                # 生成架构后缀
+                if [ -n "$variant" ]; then
+                  arch_suffix="${arch}_${variant}"
+                else
+                  arch_suffix="${arch}"
+                fi
+                
+                # 标准化架构名称
+                case "$arch_suffix" in
+                  amd64*) arch_suffix="amd64" ;;
+                  arm64*|aarch64*) arch_suffix="arm64" ;;
+                  arm_v7) arch_suffix="arm_v7" ;;
+                  arm_v6) arch_suffix="arm_v6" ;;
+                  arm_*) arch_suffix="arm_${variant}" ;;
+                  ppc64le*) arch_suffix="ppc64le" ;;
+                  s390x*) arch_suffix="s390x" ;;
+                  386*) arch_suffix="386" ;;
+                  riscv64*) arch_suffix="riscv64" ;;
+                esac
+                
+                echo "    - $arch${variant:+/$variant} → ${arch_suffix}"
+                
+                # 生成目标镜像名
+                tag_name=$(echo "$source_image" | awk -F "/" '{print $NF}')
+                # 在 tag 后添加架构后缀
+                base_tag=$(echo "$tag_name" | cut -d: -f1)
+                version_tag=$(echo "$tag_name" | cut -d: -f2)
+                target_tag="${base_tag}:${version_tag}_${arch_suffix}"
+                target_image="${TARGET_REGISTRY}/${TARGET_NAMESPACE}/${target_tag}"
+                
+                # 记录同步计划: source|arch|variant|target
+                echo "${source_image}|${arch}|${variant}|${target_image}" >> sync-plan.txt
+                echo "docker pull $target_image" >> pull-commands.txt
+                
+                total_tasks=$((total_tasks + 1))
+              done <<< "$architectures"
+              
+            else
+              # 单架构镜像
+              echo "  ℹ️  单架构镜像"
+              
+              # 获取架构信息
+              arch=$(echo "$manifest" | jq -r '.architecture // "amd64"')
+              variant=$(echo "$manifest" | jq -r '.variant // ""')
+              
+              # 生成架构后缀
+              if [ -n "$variant" ] && [ "$variant" != "null" ]; then
+                arch_suffix="${arch}_${variant}"
+              else
+                arch_suffix="${arch}"
+              fi
+              
+              # 标准化架构名称
+              case "$arch_suffix" in
+                amd64*) arch_suffix="amd64" ;;
+                arm64*|aarch64*) arch_suffix="arm64" ;;
+                arm_v7) arch_suffix="arm_v7" ;;
+                arm_v6) arch_suffix="arm_v6" ;;
+                ppc64le*) arch_suffix="ppc64le" ;;
+                s390x*) arch_suffix="s390x" ;;
+                386*) arch_suffix="386" ;;
+                riscv64*) arch_suffix="riscv64" ;;
+              esac
+              
+              echo "    - $arch${variant:+/$variant} → ${arch_suffix}"
+              
+              # 生成目标镜像名
+              tag_name=$(echo "$source_image" | awk -F "/" '{print $NF}')
+              base_tag=$(echo "$tag_name" | cut -d: -f1)
+              version_tag=$(echo "$tag_name" | cut -d: -f2)
+              target_tag="${base_tag}:${version_tag}_${arch_suffix}"
+              target_image="${TARGET_REGISTRY}/${TARGET_NAMESPACE}/${target_tag}"
+              
+              echo "${source_image}|${arch}|${variant}|${target_image}" >> sync-plan.txt
+              echo "docker pull $target_image" >> pull-commands.txt
+              
+              total_tasks=$((total_tasks + 1))
+            fi
+            
           done < images-clean.txt
           
-          image_count=$(wc -l < source-images.txt)
-          echo "image_count=$image_count" >> $GITHUB_OUTPUT
+          source_image_count=$(wc -l < images-clean.txt)
+          
+          echo ""
+          echo "=== 同步计划 ==="
+          echo "源镜像数: $source_image_count"
+          echo "同步任务数: $total_tasks"
+          
+          echo "image_count=$source_image_count" >> $GITHUB_OUTPUT
+          echo "task_count=$total_tasks" >> $GITHUB_OUTPUT
           echo "registry=${TARGET_REGISTRY}" >> $GITHUB_OUTPUT
           echo "namespace=${TARGET_NAMESPACE}" >> $GITHUB_OUTPUT
           
-          echo "=== 待同步镜像列表 ==="
-          cat sync-mapping.txt
+          if [ "$total_tasks" -eq 0 ]; then
+            echo "⚠️  没有可同步的镜像"
+            exit 1
+          fi
 
       - name: Sync images with Skopeo
         if: steps.check_body.outputs.is_image_format == 'true'
@@ -164,65 +271,61 @@ jobs:
           > sync-failed.txt
           > sync-details.txt
           
-          total=$(wc -l < source-images.txt)
+          total=$(wc -l < sync-plan.txt)
           current=0
           
-          while IFS= read -r source_image && IFS= read -r target_image <&3; do
+          echo "=== 开始同步镜像 ==="
+          
+          while IFS='|' read -r source_image arch variant target_image; do
             current=$((current + 1))
+            
+            arch_display="${arch}${variant:+/$variant}"
+            
             echo ""
             echo "[$current/$total] 同步: $source_image"
+            echo "         架构: $arch_display"
             echo "         -> $target_image"
             
             success=false
             sync_method=""
             
-            # 策略 1: 尝试多架构同步 (OCI)
-            echo "  尝试: 多架构 OCI 格式"
-            skopeo copy \
-              --all \
+            # 构建 skopeo 命令
+            skopeo_cmd=(skopeo copy
+              --override-arch "$arch"
+              --override-os linux
+            )
+            
+            # 如果有 variant，添加参数
+            if [ -n "$variant" ] && [ "$variant" != "null" ]; then
+              skopeo_cmd+=(--override-variant "$variant")
+            fi
+            
+            # 策略 1: 尝试 OCI 格式
+            echo "  尝试: OCI 格式"
+            "${skopeo_cmd[@]}" \
               --format oci \
-              --retry-times 1 \
+              --retry-times 2 \
               "docker://$source_image" \
               "docker://$target_image" 2>&1 | tee /tmp/skopeo_oci.log
             
-            # 检查 PIPESTATUS 获取 skopeo 的真实退出码
             if [ "${PIPESTATUS[0]}" -eq 0 ]; then
-              echo "  ✅ 成功 (多架构 OCI)"
-              sync_method="多架构 OCI"
+              echo "  ✅ 成功 (OCI)"
+              sync_method="OCI"
               success=true
             fi
             
-            # 策略 2: 如果失败且是格式问题，尝试 v2s2
-            if [ "$success" = false ] && grep -qE "unsupported MIME type|invalid.*format" /tmp/skopeo_oci.log 2>/dev/null; then
-              echo "  ⚠️  格式不兼容，尝试: Docker v2s2 格式"
-              skopeo copy \
-                --all \
+            # 策略 2: 如果失败，尝试 v2s2 格式
+            if [ "$success" = false ]; then
+              echo "  ⚠️  OCI 失败，尝试: v2s2 格式"
+              "${skopeo_cmd[@]}" \
                 --format v2s2 \
-                --retry-times 1 \
+                --retry-times 2 \
                 "docker://$source_image" \
                 "docker://$target_image" 2>&1 | tee /tmp/skopeo_v2s2.log
               
               if [ "${PIPESTATUS[0]}" -eq 0 ]; then
-                echo "  ✅ 成功 (多架构 v2s2)"
-                sync_method="多架构 v2s2"
-                success=true
-              fi
-            fi
-            
-            # 策略 3: Fallback 到 amd64 单架构
-            if [ "$success" = false ]; then
-              echo "  ⚠️  多架构失败，fallback: amd64 单架构"
-              skopeo copy \
-                --override-arch amd64 \
-                --override-os linux \
-                --format v2s2 \
-                --retry-times 2 \
-                "docker://$source_image" \
-                "docker://$target_image" 2>&1 | tee /tmp/skopeo_amd64.log
-              
-              if [ "${PIPESTATUS[0]}" -eq 0 ]; then
-                echo "  ✅ 成功 (amd64 单架构)"
-                sync_method="amd64 单架构"
+                echo "  ✅ 成功 (v2s2)"
+                sync_method="v2s2"
                 success=true
               fi
             fi
@@ -230,13 +333,13 @@ jobs:
             # 记录结果
             if [ "$success" = true ]; then
               echo "$target_image" >> sync-success.txt
-              echo "✅ $source_image → $target_image ($sync_method)" >> sync-details.txt
+              echo "✅ $source_image ($arch_display) → $target_image" >> sync-details.txt
             else
-              echo "$source_image -> $target_image" >> sync-failed.txt
-              echo "❌ $source_image → 同步失败" >> sync-details.txt
+              echo "$source_image ($arch_display) -> $target_image" >> sync-failed.txt
+              echo "❌ $source_image ($arch_display) → 同步失败" >> sync-details.txt
             fi
             
-          done < source-images.txt 3< target-images.txt
+          done < sync-plan.txt
           
           success_count=$(wc -l < sync-success.txt 2>/dev/null || echo 0)
           failed_count=$(wc -l < sync-failed.txt 2>/dev/null || echo 0)
@@ -376,11 +479,14 @@ jobs:
             [查看详情](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
             
             ## 📋 同步统计
-            - 总数: ${{ steps.prepare.outputs.image_count }}
+            - 源镜像数: ${{ steps.prepare.outputs.image_count }}
+            - 同步任务数: ${{ steps.prepare.outputs.task_count }}
             - ✅ 成功: ${{ steps.sync.outputs.success_count || 0 }}
             - ❌ 失败: ${{ steps.sync.outputs.failed_count || 0 }}
             - 🏠 目标仓库: `${{ steps.prepare.outputs.registry }}`
             - 📦 命名空间: `${{ steps.prepare.outputs.namespace }}`
+            
+            > 💡 **说明**: 每个源镜像会根据其支持的架构，同步为多个带架构后缀的目标镜像（如 `nginx:1.27_amd64`, `nginx:1.27_arm64`）
             
             ${{ steps.sync.outputs.success_count > 0 && format('## 🚀 Pull 命令 (成功的镜像)
             ```bash
@@ -396,6 +502,7 @@ jobs:
             
             以下镜像同步失败，可能的原因：
             - 源镜像不存在或 tag 错误
+            - 源镜像不支持该架构
             - 网络问题或源仓库限流
             - 镜像格式不兼容
             
@@ -403,6 +510,8 @@ jobs:
             {0}
             ```
             
-            **建议：** 可以尝试重新编辑 issue 触发再次同步，或者手动使用 skopeo 同步失败的镜像。', steps.comment_body.outputs.failed_images) || '' }}
+            **建议：** 
+            - 使用 `skopeo inspect --raw docker://<镜像名>` 检查源镜像支持的架构
+            - 可以尝试重新编辑 issue 触发再次同步', steps.comment_body.outputs.failed_images) || '' }}
           reactions: ${{ steps.final_status.outputs.status == 'full_success' && 'hooray' || (steps.final_status.outputs.status == 'partial_success' && 'eyes' || 'confused') }}
           edit-mode: replace
