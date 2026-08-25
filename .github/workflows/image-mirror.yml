@@ -129,26 +129,42 @@ jobs:
           
           > sync-plan.txt
           > pull-commands.txt
+          > skipped-images.txt
           
           echo "=== 检查镜像支持的架构 ==="
           
           total_tasks=0
+          skipped_count=0
           
           while IFS= read -r source_image; do
             echo ""
             echo "📦 检查镜像: $source_image"
             
+            # 检查是否为 digest 格式
+            if echo "$source_image" | grep -q "@sha256:"; then
+              echo "  ℹ️  检测到 digest 格式镜像"
+              is_digest=true
+              digest_value=$(echo "$source_image" | grep -oE "sha256:[a-f0-9]{64}")
+              base_image_name=$(echo "$source_image" | sed 's/@sha256:.*//')
+            else
+              is_digest=false
+            fi
+            
             # 使用 skopeo inspect 获取镜像信息
-            if ! raw_manifest=$(skopeo inspect --raw "docker://$source_image" 2>/dev/null); then
+            if ! raw_manifest=$(skopeo inspect --raw "docker://$source_image" 2>&1); then
               echo "  ⚠️  无法获取镜像信息，跳过"
+              
+              # 记录跳过的镜像和原因
+              error_msg=$(echo "$raw_manifest" | head -n 1)
+              echo "${source_image}|${error_msg}" >> skipped-images.txt
+              skipped_count=$((skipped_count + 1))
               continue
             fi
             
-            # 保存 manifest 到临时文件便于调试
+            # 保存 manifest 到临时文件
             echo "$raw_manifest" > /tmp/manifest.json
             
             # 判断是否为 manifest list (多架构)
-            schema_version=$(echo "$raw_manifest" | jq -r '.schemaVersion // 0')
             media_type=$(echo "$raw_manifest" | jq -r '.mediaType // ""')
             
             # 检查是否为 manifest list
@@ -163,7 +179,6 @@ jobs:
               # 多架构镜像
               echo "  ℹ️  多架构镜像，支持以下架构:"
               
-              # 提取所有架构信息
               manifests_count=$(echo "$raw_manifest" | jq '.manifests | length')
               
               for ((i=0; i<manifests_count; i++)); do
@@ -171,82 +186,57 @@ jobs:
                 variant=$(echo "$raw_manifest" | jq -r ".manifests[$i].platform.variant // \"\"")
                 os=$(echo "$raw_manifest" | jq -r ".manifests[$i].platform.os // \"linux\"")
                 
-                # 检查是否为 attestation manifest
                 ref_type=$(echo "$raw_manifest" | jq -r ".manifests[$i].annotations.\"vnd.docker.reference.type\" // \"\"")
                 if [ "$ref_type" = "attestation-manifest" ]; then
-                  echo "    ⚠️  跳过 attestation manifest: index=$i"
                   continue
                 fi
                 
-                # 跳过 unknown 架构
                 if [ "$arch" = "unknown" ] || [ -z "$arch" ] || [ "$arch" = "null" ]; then
-                  echo "    ⚠️  跳过无效架构: index=$i (arch=$arch, os=$os)"
                   continue
                 fi
                 
-                # 跳过非 Linux 或 unknown 系统
                 if [ "$os" != "linux" ] || [ "$os" = "unknown" ]; then
-                  echo "    ⚠️  跳过非 Linux 系统: $os/$arch"
                   continue
                 fi
                 
-                # 清理 variant
                 if [ "$variant" = "null" ] || [ -z "$variant" ]; then
                   variant=""
                 fi
                 
-                # 生成架构后缀
                 if [ -n "$variant" ]; then
                   arch_suffix="${arch}_${variant}"
                 else
                   arch_suffix="${arch}"
                 fi
                 
-                # 标准化架构名称
                 case "$arch_suffix" in
-                  amd64*|x86_64*) 
-                    arch_suffix="amd64" 
-                    ;;
-                  arm64*|aarch64*)
-                    arch_suffix="arm64"
-                    ;;
-                  arm_v8)
-                    # arm64 v8 实际上就是标准 arm64
-                    arch_suffix="arm64"
-                    ;;
-                  arm_v7|armv7*)
-                    arch_suffix="arm_v7"
-                    ;;
-                  arm_v6|armv6*)
-                    arch_suffix="arm_v6"
-                    ;;
-                  arm_v5|armv5*)
-                    arch_suffix="arm_v5"
-                    ;;
-                  ppc64le*)
-                    arch_suffix="ppc64le"
-                    ;;
-                  s390x*)
-                    arch_suffix="s390x"
-                    ;;
-                  386*|i386*)
-                    arch_suffix="386"
-                    ;;
-                  riscv64*)
-                    arch_suffix="riscv64"
-                    ;;
+                  amd64*|x86_64*) arch_suffix="amd64" ;;
+                  arm64*|aarch64*) arch_suffix="arm64" ;;
+                  arm_v8) arch_suffix="arm64" ;;
+                  arm_v7|armv7*) arch_suffix="arm_v7" ;;
+                  arm_v6|armv6*) arch_suffix="arm_v6" ;;
+                  arm_v5|armv5*) arch_suffix="arm_v5" ;;
+                  ppc64le*) arch_suffix="ppc64le" ;;
+                  s390x*) arch_suffix="s390x" ;;
+                  386*|i386*) arch_suffix="386" ;;
+                  riscv64*) arch_suffix="riscv64" ;;
                 esac
                 
                 echo "    - $arch${variant:+/$variant} → ${arch_suffix}"
                 
-                # 生成目标镜像名
-                tag_name=$(echo "$source_image" | awk -F "/" '{print $NF}')
-                base_tag=$(echo "$tag_name" | cut -d: -f1)
-                version_tag=$(echo "$tag_name" | cut -d: -f2-)
-                target_tag="${base_tag}:${version_tag}_${arch_suffix}"
+                if [ "$is_digest" = true ]; then
+                  short_digest=$(echo "$digest_value" | cut -d: -f2 | cut -c1-12)
+                  tag_name=$(echo "$base_image_name" | awk -F "/" '{print $NF}')
+                  target_tag="${tag_name}:${short_digest}_${arch_suffix}"
+                else
+                  tag_name=$(echo "$source_image" | awk -F "/" '{print $NF}')
+                  base_tag=$(echo "$tag_name" | cut -d: -f1)
+                  version_tag=$(echo "$tag_name" | cut -d: -f2-)
+                  target_tag="${base_tag}:${version_tag}_${arch_suffix}"
+                fi
+                
                 target_image="${TARGET_REGISTRY}/${TARGET_NAMESPACE}/${target_tag}"
                 
-                # 记录同步计划: source|arch|variant|target
                 echo "${source_image}|${arch}|${variant}|${target_image}" >> sync-plan.txt
                 echo "docker pull $target_image" >> pull-commands.txt
                 
@@ -257,17 +247,13 @@ jobs:
               # 单架构镜像
               echo "  ℹ️  单架构镜像"
               
-              # 尝试多种方式获取架构信息
               arch=$(echo "$raw_manifest" | jq -r '.architecture // empty')
               
-              # 如果 raw manifest 没有 architecture，尝试用 skopeo inspect (非 raw)
               if [ -z "$arch" ] || [ "$arch" = "null" ]; then
-                echo "    尝试获取详细信息..."
                 if detail_info=$(skopeo inspect "docker://$source_image" 2>/dev/null); then
                   arch=$(echo "$detail_info" | jq -r '.Architecture // "amd64"')
                   variant=$(echo "$detail_info" | jq -r '.Variant // ""')
                 else
-                  echo "    ⚠️  无法获取架构信息，默认使用 amd64"
                   arch="amd64"
                   variant=""
                 fi
@@ -275,59 +261,42 @@ jobs:
                 variant=$(echo "$raw_manifest" | jq -r '.variant // ""')
               fi
               
-              # 清理 variant
               if [ "$variant" = "null" ] || [ -z "$variant" ]; then
                 variant=""
               fi
               
-              # 生成架构后缀
               if [ -n "$variant" ]; then
                 arch_suffix="${arch}_${variant}"
               else
                 arch_suffix="${arch}"
               fi
               
-              # 标准化架构名称
               case "$arch_suffix" in
-                amd64*|x86_64*) 
-                  arch_suffix="amd64" 
-                  ;;
-                arm64*|aarch64*)
-                  arch_suffix="arm64"
-                  ;;
-                arm_v8)
-                  arch_suffix="arm64"
-                  ;;
-                arm_v7|armv7*)
-                  arch_suffix="arm_v7"
-                  ;;
-                arm_v6|armv6*)
-                  arch_suffix="arm_v6"
-                  ;;
-                arm_v5|armv5*)
-                  arch_suffix="arm_v5"
-                  ;;
-                ppc64le*)
-                  arch_suffix="ppc64le"
-                  ;;
-                s390x*)
-                  arch_suffix="s390x"
-                  ;;
-                386*|i386*)
-                  arch_suffix="386"
-                  ;;
-                riscv64*)
-                  arch_suffix="riscv64"
-                  ;;
+                amd64*|x86_64*) arch_suffix="amd64" ;;
+                arm64*|aarch64*) arch_suffix="arm64" ;;
+                arm_v8) arch_suffix="arm64" ;;
+                arm_v7|armv7*) arch_suffix="arm_v7" ;;
+                arm_v6|armv6*) arch_suffix="arm_v6" ;;
+                arm_v5|armv5*) arch_suffix="arm_v5" ;;
+                ppc64le*) arch_suffix="ppc64le" ;;
+                s390x*) arch_suffix="s390x" ;;
+                386*|i386*) arch_suffix="386" ;;
+                riscv64*) arch_suffix="riscv64" ;;
               esac
               
               echo "    - $arch${variant:+/$variant} → ${arch_suffix}"
               
-              # 生成目标镜像名
-              tag_name=$(echo "$source_image" | awk -F "/" '{print $NF}')
-              base_tag=$(echo "$tag_name" | cut -d: -f1)
-              version_tag=$(echo "$tag_name" | cut -d: -f2-)
-              target_tag="${base_tag}:${version_tag}_${arch_suffix}"
+              if [ "$is_digest" = true ]; then
+                short_digest=$(echo "$digest_value" | cut -d: -f2 | cut -c1-12)
+                tag_name=$(echo "$base_image_name" | awk -F "/" '{print $NF}')
+                target_tag="${tag_name}:${short_digest}_${arch_suffix}"
+              else
+                tag_name=$(echo "$source_image" | awk -F "/" '{print $NF}')
+                base_tag=$(echo "$tag_name" | cut -d: -f1)
+                version_tag=$(echo "$tag_name" | cut -d: -f2-)
+                target_tag="${base_tag}:${version_tag}_${arch_suffix}"
+              fi
+              
               target_image="${TARGET_REGISTRY}/${TARGET_NAMESPACE}/${target_tag}"
               
               echo "${source_image}|${arch}|${variant}|${target_image}" >> sync-plan.txt
@@ -338,7 +307,6 @@ jobs:
             
           done < images-clean.txt
           
-          # 去重（某些镜像可能有重复的架构条目）
           sort -u sync-plan.txt -o sync-plan.txt
           sort -u pull-commands.txt -o pull-commands.txt
           
@@ -349,14 +317,21 @@ jobs:
           echo "=== 同步计划 ==="
           echo "源镜像数: $source_image_count"
           echo "同步任务数: $total_tasks"
-          cat sync-plan.txt
+          echo "跳过镜像数: $skipped_count"
+          
+          if [ "$skipped_count" -gt 0 ]; then
+            echo ""
+            echo "=== 跳过的镜像 ==="
+            cat skipped-images.txt
+          fi
           
           echo "image_count=$source_image_count" >> "$GITHUB_OUTPUT"
           echo "task_count=$total_tasks" >> "$GITHUB_OUTPUT"
+          echo "skipped_count=$skipped_count" >> "$GITHUB_OUTPUT"
           echo "registry=${TARGET_REGISTRY}" >> "$GITHUB_OUTPUT"
           echo "namespace=${TARGET_NAMESPACE}" >> "$GITHUB_OUTPUT"
           
-          if [ "$total_tasks" -eq 0 ]; then
+          if [ "$total_tasks" -eq 0 ] && [ "$skipped_count" -eq 0 ]; then
             echo "⚠️  没有可同步的镜像"
             exit 1
           fi
@@ -478,12 +453,11 @@ jobs:
           fi
 
       - name: Prepare comment body
-        if: always() && steps.check_body.outputs.is_image_format == 'true' && steps.sync.outcome != 'skipped'
+        if: always() && steps.check_body.outputs.is_image_format == 'true' && steps.prepare.outcome != 'skipped'
         id: comment_body
         run: |
           TIMESTAMP=$(date +%s%N)
           
-          # 成功的镜像列表
           if [ -f sync-success.txt ] && [ -s sync-success.txt ]; then
             {
               echo "success_images<<EOF_SUCCESS_${TIMESTAMP}"
@@ -494,7 +468,6 @@ jobs:
             echo "success_images=" >> "$GITHUB_OUTPUT"
           fi
           
-          # 失败的镜像列表
           if [ -f sync-failed.txt ] && [ -s sync-failed.txt ]; then
             {
               echo "failed_images<<EOF_FAILED_${TIMESTAMP}"
@@ -505,7 +478,6 @@ jobs:
             echo "failed_images=" >> "$GITHUB_OUTPUT"
           fi
           
-          # 详细同步结果
           if [ -f sync-details.txt ] && [ -s sync-details.txt ]; then
             {
               echo "sync_details<<EOF_DETAILS_${TIMESTAMP}"
@@ -516,7 +488,20 @@ jobs:
             echo "sync_details=" >> "$GITHUB_OUTPUT"
           fi
           
-          # Pull 命令 (只包含成功的)
+          # 跳过的镜像
+          if [ -f skipped-images.txt ] && [ -s skipped-images.txt ]; then
+            {
+              echo "skipped_images<<EOF_SKIPPED_${TIMESTAMP}"
+              while IFS='|' read -r image error; do
+                echo "- $image"
+                echo "  原因: $error"
+              done < skipped-images.txt
+              echo "EOF_SKIPPED_${TIMESTAMP}"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "skipped_images=" >> "$GITHUB_OUTPUT"
+          fi
+          
           if [ -f sync-success.txt ] && [ -s sync-success.txt ]; then
             > pull-commands-success.txt
             while IFS= read -r target_image; do
@@ -586,50 +571,73 @@ jobs:
             });
 
       - name: Update comment with results
-        if: always() && steps.check_body.outputs.is_image_format == 'true' && steps.sync.outcome != 'skipped'
+        if: always() && steps.check_body.outputs.is_image_format == 'true' && steps.prepare.outcome != 'skipped'
         uses: peter-evans/create-or-update-comment@v4
         with:
           comment-id: ${{ steps.fc.outputs.comment-id || steps.create_comment.outputs.comment-id }}
           issue-number: ${{ github.event.issue.number }}
           body: |
-            ${{ steps.final_status.outputs.emoji }} **镜像同步${{ steps.final_status.outputs.status == 'full_success' && '完全成功' || (steps.final_status.outputs.status == 'partial_success' && '部分成功' || '失败') }}！**
+            ${{ steps.sync.outcome == 'skipped' && '⏭️' || steps.final_status.outputs.emoji }} **镜像同步${{ steps.sync.outcome == 'skipped' && '准备阶段' || (steps.final_status.outputs.status == 'full_success' && '完全成功' || (steps.final_status.outputs.status == 'partial_success' && '部分成功' || '失败')) }}！**
             
             [查看详情](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
             
             ## 📋 同步统计
             - 源镜像数: ${{ steps.prepare.outputs.image_count }}
             - 同步任务数: ${{ steps.prepare.outputs.task_count }}
-            - ✅ 成功: ${{ steps.sync.outputs.success_count || 0 }}
-            - ❌ 失败: ${{ steps.sync.outputs.failed_count || 0 }}
+            ${{ steps.prepare.outputs.skipped_count > 0 && format('- ⏭️ 跳过: {0}', steps.prepare.outputs.skipped_count) || '' }}
+            ${{ steps.sync.outcome != 'skipped' && format('- ✅ 成功: {0}', steps.sync.outputs.success_count || 0) || '' }}
+            ${{ steps.sync.outcome != 'skipped' && format('- ❌ 失败: {0}', steps.sync.outputs.failed_count || 0) || '' }}
             - 🏠 目标仓库: `${{ steps.prepare.outputs.registry }}`
             - 📦 命名空间: `${{ steps.prepare.outputs.namespace }}`
             
             > 💡 **说明**: 每个源镜像会根据其支持的架构，同步为多个带架构后缀的目标镜像（如 `nginx:1.27_amd64`, `nginx:1.27_arm64`）
             
-            ${{ steps.sync.outputs.success_count > 0 && format('## 🚀 Pull 命令 (成功的镜像)
+            ${{ steps.prepare.outputs.skipped_count > 0 && format('## ⏭️ 跳过的镜像
+            
+            以下镜像无法获取信息，已跳过：
+            
+            ```
+            {0}
+            ```
+            
+            **常见原因：**
+            - 镜像不存在或已被删除
+            - 源仓库访问受限（需要认证或地区限制）
+            - 镜像名称或标签错误
+            - 网络问题或源仓库不可用
+            
+            **建议：**
+            - 检查镜像名称和标签是否正确
+            - 尝试访问源仓库确认镜像是否存在
+            - 使用 `skopeo inspect docker://<镜像名>` 手动测试
+            ', steps.comment_body.outputs.skipped_images) || '' }}
+            
+            ${{ steps.sync.outcome != 'skipped' && steps.sync.outputs.success_count > 0 && format('## 🚀 Pull 命令 (成功的镜像)
             ```bash
             {0}
             ```', steps.comment_body.outputs.pull_commands) || '' }}
             
-            ## 📊 详细结果
+            ${{ steps.sync.outcome != 'skipped' && format('## 📊 详细结果
             ```
-            ${{ steps.comment_body.outputs.sync_details }}
-            ```
+            {0}
+            ```', steps.comment_body.outputs.sync_details) || '' }}
             
-            ${{ steps.sync.outputs.failed_count > 0 && format('## ❌ 失败的镜像
+            ${{ steps.sync.outcome != 'skipped' && steps.sync.outputs.failed_count > 0 && format('## ❌ 失败的镜像
             
-            以下镜像同步失败，可能的原因：
-            - 源镜像不存在或 tag 错误
-            - 源镜像不支持该架构
-            - 网络问题或源仓库限流
-            - 镜像格式不兼容
+            以下镜像同步失败：
             
             ```
             {0}
             ```
             
+            **可能的原因：**
+            - 源镜像不支持该架构
+            - 网络问题或源仓库限流
+            - 镜像格式不兼容
+            - 目标仓库空间不足或权限问题
+            
             **建议：** 
             - 使用 `skopeo inspect --raw docker://<镜像名>` 检查源镜像支持的架构
             - 可以尝试重新编辑 issue 触发再次同步', steps.comment_body.outputs.failed_images) || '' }}
-          reactions: ${{ steps.final_status.outputs.status == 'full_success' && 'hooray' || (steps.final_status.outputs.status == 'partial_success' && 'eyes' || 'confused') }}
+          reactions: ${{ steps.sync.outcome == 'skipped' && 'eyes' || (steps.final_status.outputs.status == 'full_success' && 'hooray' || (steps.final_status.outputs.status == 'partial_success' && 'eyes' || 'confused')) }}
           edit-mode: replace
