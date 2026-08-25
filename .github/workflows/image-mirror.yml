@@ -13,11 +13,7 @@ on:
         description: '测试镜像列表（每行一个，如 nginx:latest）'
         required: true
         type: string
-      branch:
-        description: '运行分支'
-        required: false
-        default: 'test'
-        type: string
+
 
 jobs:
   sync_to_target_registry:
