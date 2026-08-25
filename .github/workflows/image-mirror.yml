@@ -6,14 +6,6 @@ on:
       - opened
       - reopened
       - edited
-  # 添加手动触发
-  workflow_dispatch:
-    inputs:
-      test_images:
-        description: '测试镜像列表（每行一个，如 nginx:latest）'
-        required: true
-        type: string
-
 
 jobs:
   sync_to_target_registry:
@@ -25,27 +17,17 @@ jobs:
     steps:
       - name: Check out code
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.branch || github.ref }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.x'
 
-      # 根据触发方式准备镜像列表
       - name: Prepare image source
         id: image_source
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            # 手动触发：使用输入的镜像列表
-            echo "source=manual" >> $GITHUB_OUTPUT
-            echo "${{ github.event.inputs.test_images }}" > issue_body.txt
-          else
-            # issue 触发：使用 issue body
-            echo "source=issue" >> $GITHUB_OUTPUT
-            echo "${{ github.event.issue.body }}" > issue_body.txt
-          fi
+          echo "source=issue" >> $GITHUB_OUTPUT
+          echo "${{ github.event.issue.body }}" > issue_body.txt
 
       - name: Check issue body for image format
         id: check_body
@@ -53,7 +35,7 @@ jobs:
           python .github/scripts/check_image_format.py "$(cat issue_body.txt)"
 
       - name: Add comment if body is not image format
-        if: steps.check_body.outputs.is_image_format == 'false' && github.event_name == 'issues'
+        if: steps.check_body.outputs.is_image_format == 'false'
         uses: peter-evans/create-or-update-comment@v4
         with:
           issue-number: ${{ github.event.issue.number }}
@@ -67,7 +49,7 @@ jobs:
           edit-mode: replace
 
       - name: Update issue title with image summary
-        if: steps.check_body.outputs.is_image_format == 'true' && github.event_name == 'issues'
+        if: steps.check_body.outputs.is_image_format == 'true'
         uses: actions/github-script@v7
         with:
           script: |
@@ -91,15 +73,15 @@ jobs:
               title: newTitle
             });
 
-      - name: Add image-mirror label if body is image format
-        if: steps.check_body.outputs.is_image_format == 'true' && github.event_name == 'issues'
+      - name: Add image-mirror label
+        if: steps.check_body.outputs.is_image_format == 'true'
         uses: actions-ecosystem/action-add-labels@v1
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           labels: 'image-mirror'
 
       - name: Find existing comment
-        if: steps.check_body.outputs.is_image_format == 'true' && github.event_name == 'issues'
+        if: steps.check_body.outputs.is_image_format == 'true'
         uses: peter-evans/find-comment@v3
         id: fc
         with:
@@ -108,7 +90,7 @@ jobs:
           body-includes: 'Syncing image to TargetRegistry'
 
       - name: Create initial comment
-        if: steps.check_body.outputs.is_image_format == 'true' && steps.fc.outputs.comment-id == '' && github.event_name == 'issues'
+        if: steps.check_body.outputs.is_image_format == 'true' && steps.fc.outputs.comment-id == ''
         uses: peter-evans/create-or-update-comment@v4
         with:
           issue-number: ${{ github.event.issue.number }}
@@ -130,19 +112,18 @@ jobs:
           TARGET_NAMESPACE: ${{ vars.TARGET_NAMESPACE }}
           TARGET_REGISTRY: ${{ vars.TARGET_REGISTRY }}
         run: |
-          # 读取准备好的 body
           cat issue_body.txt > images-raw.txt
           
-          # 清理文件：移除空白行、空格、制表符
+          # 清理文件
           sed -e 's/^[ \t]*//g' \
               -e 's/[ \t]*$//g' \
               -e '/^[[:space:]]*$/d' \
               images-raw.txt | tail -n +2 > images-clean.txt
           
-          # 生成源镜像和目标镜像映射
           > source-images.txt
           > target-images.txt
           > sync-mapping.txt
+          > pull-commands.txt
           
           while IFS= read -r source_image; do
             tag_name=$(echo "$source_image" | awk -F "/" '{print $NF}')
@@ -151,21 +132,27 @@ jobs:
             echo "$source_image" >> source-images.txt
             echo "$target_image" >> target-images.txt
             echo "$source_image -> $target_image" >> sync-mapping.txt
+            
+            # 生成 pull 命令
+            echo "docker pull $target_image" >> pull-commands.txt
           done < images-clean.txt
           
           image_count=$(wc -l < source-images.txt)
           echo "image_count=$image_count" >> $GITHUB_OUTPUT
+          echo "registry=${TARGET_REGISTRY}" >> $GITHUB_OUTPUT
+          echo "namespace=${TARGET_NAMESPACE}" >> $GITHUB_OUTPUT
           
           echo "=== 待同步镜像列表 ==="
           cat sync-mapping.txt
 
       - name: Sync images with Skopeo
+        if: steps.check_body.outputs.is_image_format == 'true'
         id: sync
         env:
           TARGET_REGISTRY_PASSWORD: ${{ secrets.TARGET_REGISTRY_PASSWORD }}
           TARGET_REGISTRY_USER: ${{ vars.TARGET_REGISTRY_USER }}
-          TARGET_NAMESPACE: ${{ github.event.inputs.target_namespace || vars.TARGET_NAMESPACE }}
-          TARGET_REGISTRY: ${{ github.event.inputs.target_registry || vars.TARGET_REGISTRY }}
+          TARGET_NAMESPACE: ${{ vars.TARGET_NAMESPACE }}
+          TARGET_REGISTRY: ${{ vars.TARGET_REGISTRY }}
         run: |
           if [ -n "$TARGET_REGISTRY_USER" ] && [ -n "$TARGET_REGISTRY_PASSWORD" ]; then
             echo "🔐 登录目标仓库..."
@@ -187,7 +174,7 @@ jobs:
             echo "         -> $target_image"
             
             if skopeo copy \
-              --all         \
+              --all \
               --format oci \
               --retry-times 3 \
               "docker://$source_image" \
@@ -218,9 +205,8 @@ jobs:
             exit 1
           fi
 
-
       - name: Add success label
-        if: success() && steps.check_body.outputs.is_image_format == 'true' && github.event_name == 'issues'
+        if: success() && steps.check_body.outputs.is_image_format == 'true'
         uses: actions/github-script@v7
         with:
           script: |
@@ -232,32 +218,40 @@ jobs:
             })
 
       - name: Prepare comment body
+        if: steps.check_body.outputs.is_image_format == 'true'
         id: comment_body
         run: |
-          {
-            echo 'source_images<<EOF'
-            cat source-images.txt 2>/dev/null || echo ""
-            echo 'EOF'
-          } >> $GITHUB_OUTPUT
+          TIMESTAMP=$(date +%s%N)
           
-          {
-            echo 'target_images<<EOF'
-            cat target-images.txt 2>/dev/null || echo ""
-            echo 'EOF'
-          } >> $GITHUB_OUTPUT
-          
-          if [ -f script.md ]; then
-            {
-              echo 'extra_info<<EOF'
-              cat script.md
-              echo 'EOF'
-            } >> $GITHUB_OUTPUT
+          # 源镜像列表
+          if [ -f source-images.txt ] && [ -s source-images.txt ]; then
+            echo "source_images<<EOF_SRC_${TIMESTAMP}" >> $GITHUB_OUTPUT
+            cat source-images.txt >> $GITHUB_OUTPUT
+            echo "EOF_SRC_${TIMESTAMP}" >> $GITHUB_OUTPUT
           else
-            echo 'extra_info=' >> $GITHUB_OUTPUT
+            echo "source_images=" >> $GITHUB_OUTPUT
+          fi
+          
+          # 目标镜像列表
+          if [ -f target-images.txt ] && [ -s target-images.txt ]; then
+            echo "target_images<<EOF_TGT_${TIMESTAMP}" >> $GITHUB_OUTPUT
+            cat target-images.txt >> $GITHUB_OUTPUT
+            echo "EOF_TGT_${TIMESTAMP}" >> $GITHUB_OUTPUT
+          else
+            echo "target_images=" >> $GITHUB_OUTPUT
+          fi
+          
+          # Pull 命令列表
+          if [ -f pull-commands.txt ] && [ -s pull-commands.txt ]; then
+            echo "pull_commands<<EOF_PULL_${TIMESTAMP}" >> $GITHUB_OUTPUT
+            cat pull-commands.txt >> $GITHUB_OUTPUT
+            echo "EOF_PULL_${TIMESTAMP}" >> $GITHUB_OUTPUT
+          else
+            echo "pull_commands=" >> $GITHUB_OUTPUT
           fi
 
       - name: Update comment on success
-        if: success() && steps.check_body.outputs.is_image_format == 'true' && github.event_name == 'issues'
+        if: success() && steps.check_body.outputs.is_image_format == 'true'
         uses: peter-evans/create-or-update-comment@v4
         with:
           comment-id: ${{ steps.fc.outputs.comment-id }}
@@ -271,6 +265,13 @@ jobs:
             - 总数: ${{ steps.prepare.outputs.image_count }}
             - 成功: ${{ steps.sync.outputs.success_count }}
             - 失败: ${{ steps.sync.outputs.failed_count }}
+            - 目标仓库: `${{ steps.prepare.outputs.registry }}`
+            - 命名空间: `${{ steps.prepare.outputs.namespace }}`
+            
+            ## 🚀 Pull 命令
+            ```bash
+            ${{ steps.comment_body.outputs.pull_commands }}
+            ```
             
             ## 🎯 目标镜像列表
             ```
@@ -281,13 +282,11 @@ jobs:
             ```
             ${{ steps.comment_body.outputs.source_images }}
             ```
-            
-            ${{ steps.comment_body.outputs.extra_info }}
           reactions: hooray
           edit-mode: replace
 
       - name: Update comment on failure
-        if: failure() && steps.check_body.outputs.is_image_format == 'true' && github.event_name == 'issues'
+        if: failure() && steps.check_body.outputs.is_image_format == 'true'
         uses: peter-evans/create-or-update-comment@v4
         with:
           comment-id: ${{ steps.fc.outputs.comment-id }}
@@ -308,19 +307,3 @@ jobs:
             
             [查看详细日志](https://github.com/${{ github.repository_owner }}/image-mirror/actions/runs/${{ github.run_id }})
           reactions: confused
-
-      # 手动触发时的结果摘要
-      - name: Manual trigger summary
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          echo "## 🎯 测试运行完成" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**分支**: ${{ github.event.inputs.branch || github.ref }}" >> $GITHUB_STEP_SUMMARY
-          echo "**总数**: ${{ steps.prepare.outputs.image_count }}" >> $GITHUB_STEP_SUMMARY
-          echo "**成功**: ${{ steps.sync.outputs.success_count }}" >> $GITHUB_STEP_SUMMARY
-          echo "**失败**: ${{ steps.sync.outputs.failed_count }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 目标镜像" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          cat target-images.txt >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
