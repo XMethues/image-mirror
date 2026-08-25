@@ -178,12 +178,15 @@ jobs:
             
             # 策略 1: 尝试多架构同步 (OCI)
             echo "  尝试: 多架构 OCI 格式"
-            if skopeo copy \
+            skopeo copy \
               --all \
               --format oci \
               --retry-times 1 \
               "docker://$source_image" \
-              "docker://$target_image" 2>&1 | tee /tmp/skopeo_oci.log; then
+              "docker://$target_image" 2>&1 | tee /tmp/skopeo_oci.log
+            
+            # 检查 PIPESTATUS 获取 skopeo 的真实退出码
+            if [ "${PIPESTATUS[0]}" -eq 0 ]; then
               echo "  ✅ 成功 (多架构 OCI)"
               sync_method="多架构 OCI"
               success=true
@@ -192,12 +195,14 @@ jobs:
             # 策略 2: 如果失败且是格式问题，尝试 v2s2
             if [ "$success" = false ] && grep -qE "unsupported MIME type|invalid.*format" /tmp/skopeo_oci.log 2>/dev/null; then
               echo "  ⚠️  格式不兼容，尝试: Docker v2s2 格式"
-              if skopeo copy \
+              skopeo copy \
                 --all \
                 --format v2s2 \
                 --retry-times 1 \
                 "docker://$source_image" \
-                "docker://$target_image" 2>&1 | tee /tmp/skopeo_v2s2.log; then
+                "docker://$target_image" 2>&1 | tee /tmp/skopeo_v2s2.log
+              
+              if [ "${PIPESTATUS[0]}" -eq 0 ]; then
                 echo "  ✅ 成功 (多架构 v2s2)"
                 sync_method="多架构 v2s2"
                 success=true
@@ -207,13 +212,15 @@ jobs:
             # 策略 3: Fallback 到 amd64 单架构
             if [ "$success" = false ]; then
               echo "  ⚠️  多架构失败，fallback: amd64 单架构"
-              if skopeo copy \
+              skopeo copy \
                 --override-arch amd64 \
                 --override-os linux \
                 --format v2s2 \
                 --retry-times 2 \
                 "docker://$source_image" \
-                "docker://$target_image"; then
+                "docker://$target_image" 2>&1 | tee /tmp/skopeo_amd64.log
+              
+              if [ "${PIPESTATUS[0]}" -eq 0 ]; then
                 echo "  ✅ 成功 (amd64 单架构)"
                 sync_method="amd64 单架构"
                 success=true
